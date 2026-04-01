@@ -1,0 +1,15 @@
+version: '3.8'
+services:
+  billfold:
+    build: .
+    ports:
+      - "9270:9270"
+    environment:
+      - PORT=9270
+      - DATA_DIR=/data
+      - BILLFOLD_LICENSE_KEY=
+    volumes:
+      - billfold_data:/data
+    restart: unless-stopped
+volumes:
+  billfold_data:
