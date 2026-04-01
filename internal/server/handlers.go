@@ -1,60 +1,13 @@
 package server
-
-import (
-	"encoding/json"
-	"net/http"
-	"strconv"
-)
-
-type Item struct {
-	ID        int64  `json:"id"`
-	Name      string `json:"name"`
-	CreatedAt string `json:"created_at"`
-}
-
-func (s *Server) handleListItems(w http.ResponseWriter, r *http.Request) {
-	// List items — tool-specific query would go here
-	writeJSON(w, http.StatusOK, []Item{})
-}
-
-func (s *Server) handleCreateItem(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Name string `json:"name"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request")
-		return
-	}
-	if req.Name == "" {
-		writeError(w, http.StatusBadRequest, "name required")
-		return
-	}
-	writeJSON(w, http.StatusCreated, map[string]string{"status": "created", "name": req.Name})
-}
-
-func (s *Server) handleGetItem(w http.ResponseWriter, r *http.Request) {
-	idStr := r.PathValue("id")
-	id, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid id")
-		return
-	}
-	writeJSON(w, http.StatusOK, Item{ID: id})
-}
-
-func (s *Server) handleUpdateItem(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
-}
-
-func (s *Server) handleDeleteItem(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
-}
-
-func (s *Server) handleUI(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html")
-	w.Write(dashboardHTML)
-}
+import("encoding/json";"net/http";"strconv";"github.com/stockyard-dev/stockyard-billfold/internal/store")
+func(s *Server)handleListClients(w http.ResponseWriter,r *http.Request){list,_:=s.db.ListClients();if list==nil{list=[]store.Client{}};writeJSON(w,200,list)}
+func(s *Server)handleCreateClient(w http.ResponseWriter,r *http.Request){var c store.Client;json.NewDecoder(r.Body).Decode(&c);if c.Name==""{writeError(w,400,"name required");return};if err:=s.db.CreateClient(&c);err!=nil{writeError(w,500,err.Error());return};writeJSON(w,201,c)}
+func(s *Server)handleDeleteClient(w http.ResponseWriter,r *http.Request){id,_:=strconv.ParseInt(r.PathValue("id"),10,64);s.db.DeleteClient(id);writeJSON(w,200,map[string]string{"status":"deleted"})}
+func(s *Server)handleListInvoices(w http.ResponseWriter,r *http.Request){status:=r.URL.Query().Get("status");list,_:=s.db.ListInvoices(status);if list==nil{list=[]store.Invoice{}};writeJSON(w,200,list)}
+func(s *Server)handleCreateInvoice(w http.ResponseWriter,r *http.Request){var inv store.Invoice;json.NewDecoder(r.Body).Decode(&inv);if inv.ClientID==0{writeError(w,400,"client_id required");return};if err:=s.db.CreateInvoice(&inv);err!=nil{writeError(w,500,err.Error());return};writeJSON(w,201,inv)}
+func(s *Server)handleUpdateInvoice(w http.ResponseWriter,r *http.Request){id,_:=strconv.ParseInt(r.PathValue("id"),10,64);var req struct{Status string `json:"status"`};json.NewDecoder(r.Body).Decode(&req);s.db.UpdateInvoiceStatus(id,req.Status);writeJSON(w,200,map[string]string{"status":"updated"})}
+func(s *Server)handleDeleteInvoice(w http.ResponseWriter,r *http.Request){id,_:=strconv.ParseInt(r.PathValue("id"),10,64);s.db.DeleteInvoice(id);writeJSON(w,200,map[string]string{"status":"deleted"})}
+func(s *Server)handleGetLineItems(w http.ResponseWriter,r *http.Request){id,_:=strconv.ParseInt(r.PathValue("id"),10,64);list,_:=s.db.GetLineItems(id);if list==nil{list=[]store.LineItem{}};writeJSON(w,200,list)}
+func(s *Server)handleAddLineItem(w http.ResponseWriter,r *http.Request){id,_:=strconv.ParseInt(r.PathValue("id"),10,64);var li store.LineItem;json.NewDecoder(r.Body).Decode(&li);li.InvoiceID=id;if li.Description==""{writeError(w,400,"description required");return};if li.Qty==0{li.Qty=1};if err:=s.db.AddLineItem(&li);err!=nil{writeError(w,500,err.Error());return};writeJSON(w,201,li)}
+func(s *Server)handleDeleteLineItem(w http.ResponseWriter,r *http.Request){id,_:=strconv.ParseInt(r.PathValue("id"),10,64);s.db.DeleteLineItem(id);writeJSON(w,200,map[string]string{"status":"deleted"})}
+func(s *Server)handleStats(w http.ResponseWriter,r *http.Request){m,_:=s.db.Stats();writeJSON(w,200,m)}
