@@ -1,19 +1,23 @@
 package store
-import("database/sql";"fmt";"os";"path/filepath";"time";_ "modernc.org/sqlite")
-type DB struct{*sql.DB}
-type Client struct{ID int64 `json:"id"`;Name string `json:"name"`;Email string `json:"email"`;Address string `json:"address"`;CreatedAt time.Time `json:"created_at"`}
-type Invoice struct{ID int64 `json:"id"`;ClientID int64 `json:"client_id"`;ClientName string `json:"client_name,omitempty"`;Number string `json:"number"`;Status string `json:"status"`;IssuedDate string `json:"issued_date"`;DueDate string `json:"due_date"`;Notes string `json:"notes"`;TotalCents int64 `json:"total_cents"`;Items []LineItem `json:"items,omitempty"`;CreatedAt time.Time `json:"created_at"`}
-type LineItem struct{ID int64 `json:"id"`;InvoiceID int64 `json:"invoice_id"`;Description string `json:"description"`;Qty float64 `json:"qty"`;UnitCents int64 `json:"unit_cents"`;TotalCents int64 `json:"total_cents"`}
-func Open(dataDir string)(*DB,error){if err:=os.MkdirAll(dataDir,0755);err!=nil{return nil,fmt.Errorf("mkdir: %w",err)};dsn:=filepath.Join(dataDir,"billfold.db")+"?_journal_mode=WAL&_busy_timeout=5000";db,err:=sql.Open("sqlite",dsn);if err!=nil{return nil,fmt.Errorf("open: %w",err)};db.SetMaxOpenConns(1);if err:=migrate(db);err!=nil{return nil,fmt.Errorf("migrate: %w",err)};return &DB{db},nil}
-func migrate(db *sql.DB)error{_,err:=db.Exec(`CREATE TABLE IF NOT EXISTS clients(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,email TEXT DEFAULT '',address TEXT DEFAULT '',created_at DATETIME DEFAULT CURRENT_TIMESTAMP);CREATE TABLE IF NOT EXISTS invoices(id INTEGER PRIMARY KEY AUTOINCREMENT,client_id INTEGER NOT NULL,number TEXT NOT NULL UNIQUE,status TEXT DEFAULT 'draft',issued_date TEXT DEFAULT '',due_date TEXT DEFAULT '',notes TEXT DEFAULT '',total_cents INTEGER DEFAULT 0,created_at DATETIME DEFAULT CURRENT_TIMESTAMP);CREATE TABLE IF NOT EXISTS line_items(id INTEGER PRIMARY KEY AUTOINCREMENT,invoice_id INTEGER NOT NULL,description TEXT NOT NULL,qty REAL DEFAULT 1,unit_cents INTEGER DEFAULT 0,total_cents INTEGER DEFAULT 0);`);return err}
-func(db *DB)ListClients()([]Client,error){rows,err:=db.Query(`SELECT id,name,email,address,created_at FROM clients ORDER BY name`);if err!=nil{return nil,err};defer rows.Close();var out[]Client;for rows.Next(){var c Client;rows.Scan(&c.ID,&c.Name,&c.Email,&c.Address,&c.CreatedAt);out=append(out,c)};return out,nil}
-func(db *DB)CreateClient(c *Client)error{res,err:=db.Exec(`INSERT INTO clients(name,email,address)VALUES(?,?,?)`,c.Name,c.Email,c.Address);if err!=nil{return err};c.ID,_=res.LastInsertId();return nil}
-func(db *DB)DeleteClient(id int64)error{_,err:=db.Exec(`DELETE FROM clients WHERE id=?`,id);return err}
-func(db *DB)ListInvoices(status string)([]Invoice,error){q:=`SELECT i.id,i.client_id,COALESCE(c.name,''),i.number,i.status,i.issued_date,i.due_date,i.notes,i.total_cents,i.created_at FROM invoices i LEFT JOIN clients c ON c.id=i.client_id`;var rows *sql.Rows;var err error;if status!=""{rows,err=db.Query(q+` WHERE i.status=? ORDER BY i.created_at DESC`,status)}else{rows,err=db.Query(q+` ORDER BY i.created_at DESC`)};if err!=nil{return nil,err};defer rows.Close();var out[]Invoice;for rows.Next(){var inv Invoice;rows.Scan(&inv.ID,&inv.ClientID,&inv.ClientName,&inv.Number,&inv.Status,&inv.IssuedDate,&inv.DueDate,&inv.Notes,&inv.TotalCents,&inv.CreatedAt);out=append(out,inv)};return out,nil}
-func(db *DB)CreateInvoice(inv *Invoice)error{if inv.Number==""{inv.Number=fmt.Sprintf("INV-%d",time.Now().UnixNano()/1e6)};if inv.Status==""{inv.Status="draft"};res,err:=db.Exec(`INSERT INTO invoices(client_id,number,status,issued_date,due_date,notes)VALUES(?,?,?,?,?,?)`,inv.ClientID,inv.Number,inv.Status,inv.IssuedDate,inv.DueDate,inv.Notes);if err!=nil{return err};inv.ID,_=res.LastInsertId();return nil}
-func(db *DB)UpdateInvoiceStatus(id int64,status string)error{_,err:=db.Exec(`UPDATE invoices SET status=? WHERE id=?`,status,id);return err}
-func(db *DB)DeleteInvoice(id int64)error{_,err:=db.Exec(`DELETE FROM invoices WHERE id=?`,id);_,_=db.Exec(`DELETE FROM line_items WHERE invoice_id=?`,id);return err}
-func(db *DB)AddLineItem(item *LineItem)error{item.TotalCents=int64(float64(item.UnitCents)*item.Qty);res,err:=db.Exec(`INSERT INTO line_items(invoice_id,description,qty,unit_cents,total_cents)VALUES(?,?,?,?,?)`,item.InvoiceID,item.Description,item.Qty,item.UnitCents,item.TotalCents);if err!=nil{return err};item.ID,_=res.LastInsertId();db.Exec(`UPDATE invoices SET total_cents=(SELECT COALESCE(SUM(total_cents),0) FROM line_items WHERE invoice_id=?) WHERE id=?`,item.InvoiceID,item.InvoiceID);return nil}
-func(db *DB)DeleteLineItem(id int64)error{var inv int64;db.QueryRow(`SELECT invoice_id FROM line_items WHERE id=?`,id).Scan(&inv);_,err:=db.Exec(`DELETE FROM line_items WHERE id=?`,id);if inv>0{db.Exec(`UPDATE invoices SET total_cents=(SELECT COALESCE(SUM(total_cents),0) FROM line_items WHERE invoice_id=?) WHERE id=?`,inv,inv)};return err}
-func(db *DB)GetLineItems(invoiceID int64)([]LineItem,error){rows,err:=db.Query(`SELECT id,invoice_id,description,qty,unit_cents,total_cents FROM line_items WHERE invoice_id=? ORDER BY id`,invoiceID);if err!=nil{return nil,err};defer rows.Close();var out[]LineItem;for rows.Next(){var li LineItem;rows.Scan(&li.ID,&li.InvoiceID,&li.Description,&li.Qty,&li.UnitCents,&li.TotalCents);out=append(out,li)};return out,nil}
-func(db *DB)Stats()(map[string]interface{},error){var draft,sent,paid int;var totalPaid int64;db.QueryRow(`SELECT COUNT(*) FROM invoices WHERE status='draft'`).Scan(&draft);db.QueryRow(`SELECT COUNT(*) FROM invoices WHERE status='sent'`).Scan(&sent);db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(total_cents),0) FROM invoices WHERE status='paid'`).Scan(&paid,&totalPaid);return map[string]interface{}{"draft":draft,"sent":sent,"paid":paid,"total_paid_cents":totalPaid},nil}
+import ("database/sql";"fmt";"os";"path/filepath";"time";_ "modernc.org/sqlite")
+type DB struct{db *sql.DB}
+type Wallet struct{
+	ID string `json:"id"`
+	Name string `json:"name"`
+	Currency string `json:"currency"`
+	Balance float64 `json:"balance"`
+	Type string `json:"type"`
+	Description string `json:"description"`
+	CreatedAt string `json:"created_at"`
+}
+func Open(d string)(*DB,error){if err:=os.MkdirAll(d,0755);err!=nil{return nil,err};db,err:=sql.Open("sqlite",filepath.Join(d,"billfold.db")+"?_journal_mode=WAL&_busy_timeout=5000");if err!=nil{return nil,err}
+db.Exec(`CREATE TABLE IF NOT EXISTS wallets(id TEXT PRIMARY KEY,name TEXT NOT NULL,currency TEXT DEFAULT 'USD',balance REAL DEFAULT 0,type TEXT DEFAULT 'personal',description TEXT DEFAULT '',created_at TEXT DEFAULT(datetime('now')))`)
+return &DB{db:db},nil}
+func(d *DB)Close()error{return d.db.Close()}
+func genID()string{return fmt.Sprintf("%d",time.Now().UnixNano())}
+func now()string{return time.Now().UTC().Format(time.RFC3339)}
+func(d *DB)Create(e *Wallet)error{e.ID=genID();e.CreatedAt=now();_,err:=d.db.Exec(`INSERT INTO wallets(id,name,currency,balance,type,description,created_at)VALUES(?,?,?,?,?,?,?)`,e.ID,e.Name,e.Currency,e.Balance,e.Type,e.Description,e.CreatedAt);return err}
+func(d *DB)Get(id string)*Wallet{var e Wallet;if d.db.QueryRow(`SELECT id,name,currency,balance,type,description,created_at FROM wallets WHERE id=?`,id).Scan(&e.ID,&e.Name,&e.Currency,&e.Balance,&e.Type,&e.Description,&e.CreatedAt)!=nil{return nil};return &e}
+func(d *DB)List()[]Wallet{rows,_:=d.db.Query(`SELECT id,name,currency,balance,type,description,created_at FROM wallets ORDER BY created_at DESC`);if rows==nil{return nil};defer rows.Close();var o []Wallet;for rows.Next(){var e Wallet;rows.Scan(&e.ID,&e.Name,&e.Currency,&e.Balance,&e.Type,&e.Description,&e.CreatedAt);o=append(o,e)};return o}
+func(d *DB)Delete(id string)error{_,err:=d.db.Exec(`DELETE FROM wallets WHERE id=?`,id);return err}
+func(d *DB)Count()int{var n int;d.db.QueryRow(`SELECT COUNT(*) FROM wallets`).Scan(&n);return n}
