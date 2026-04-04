@@ -23,7 +23,7 @@ func(s *Server)list(w http.ResponseWriter,r *http.Request){
     if q!=""||len(filters)>0{wj(w,200,map[string]any{"invoices":oe(s.db.Search(q,filters))});return}
     wj(w,200,map[string]any{"invoices":oe(s.db.List())})
 }
-func(s *Server)create(w http.ResponseWriter,r *http.Request){if s.limits.MaxItems>0{items:=s.db.List();if len(items)>=s.limits.MaxItems{we(w,402,"Free tier limit reached. Upgrade at https://stockyard.dev/billfold/");return}};var e store.Invoice;json.NewDecoder(r.Body).Decode(&e);if e.ClientName==""{we(w,400,"name required");return};s.db.Create(&e);wj(w,201,s.db.Get(e.ID))}
+func(s *Server)create(w http.ResponseWriter,r *http.Request){if s.limits.MaxItems>0{if s.db.Count()>=s.limits.MaxItems{we(w,402,"Free tier limit reached. Upgrade at https://stockyard.dev/billfold/");return}};var e store.Invoice;json.NewDecoder(r.Body).Decode(&e);if e.ClientName==""{we(w,400,"name required");return};s.db.Create(&e);wj(w,201,s.db.Get(e.ID))}
 func(s *Server)get(w http.ResponseWriter,r *http.Request){e:=s.db.Get(r.PathValue("id"));if e==nil{we(w,404,"not found");return};wj(w,200,e)}
 func(s *Server)update(w http.ResponseWriter,r *http.Request){
     existing:=s.db.Get(r.PathValue("id"));if existing==nil{we(w,404,"not found");return}
