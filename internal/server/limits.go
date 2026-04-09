@@ -6,38 +6,104 @@ import (
 	"encoding/json"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
 
-const publicKeyHex = "3af8f9593b3331c27994f1eeacf111c727ff6015016b0af44ed3ca6934d40b13"
+// publicKeyHex is the Ed25519 public key used to verify license signatures.
+// It is a var (not const) only so tests can substitute a test keypair —
+// production code never reassigns it. The current value is the same key
+// used by the Stockyard checkout webhook to sign license payloads.
+var publicKeyHex = "3af8f9593b3331c27994f1eeacf111c727ff6015016b0af44ed3ca6934d40b13"
 
+// licenseFilename is the per-data-dir fallback location for the license
+// key when STOCKYARD_LICENSE_KEY env var is not set. This lets a customer
+// activate their license once via POST /api/license/activate and have it
+// persist across reboots without rewriting their shell rc.
+const licenseFilename = "license.txt"
+
+// Limits describes what the running tool is allowed to do. There is NO
+// free tier — Stockyard sells a $7.99/mo bundle with a 14-day paid trial,
+// and the open-core proxy is the only thing that runs without a license.
+//
+// Tier semantics:
+//   - "pro"             — license valid, unlimited reads and writes
+//   - "trial-required"  — no license; reads allowed, writes return 402,
+//     dashboard shows a banner directing the user to
+//     start a trial OR paste a key they already have
+//   - ""                — used by tests to bypass the license middleware;
+//     treated as licensed for backward-compat with
+//     pre-license-gate tests
 type Limits struct {
-	MaxItems int
-	Tier     string
+	MaxItems int    // 0 = no cap; reserved for future per-tier limits
+	Tier     string // "pro" | "trial-required" | ""
 }
 
-func FreeLimits() Limits {
-	return Limits{MaxItems: 5, Tier: "free"}
+// TrialRequiredLimits is the default state when no valid license is
+// present. There is no item cap — capping items would punish customers
+// who pasted the wrong key or whose env var got nuked, and the brand
+// promise is that data on disk stays accessible. The write block is
+// enforced by the license middleware in server.go, not by an item count.
+func TrialRequiredLimits() Limits {
+	return Limits{MaxItems: 0, Tier: "trial-required"}
 }
 
+// ProLimits is the licensed state. No item cap, no write block.
 func ProLimits() Limits {
 	return Limits{MaxItems: 0, Tier: "pro"}
 }
 
-func DefaultLimits() Limits {
-	key := os.Getenv("STOCKYARD_LICENSE_KEY")
+// DefaultLimits resolves the license key from (1) the STOCKYARD_LICENSE_KEY
+// env var, then (2) the licenseFilename in the data directory. The data-dir
+// fallback exists so a customer can activate their license once via the
+// dashboard's "already have a key?" inline input and have it persist across
+// reboots without remembering to set a shell variable.
+//
+// dataDir may be empty (callers without a data dir, e.g. tests) — in that
+// case the file fallback is skipped and only the env var matters.
+func DefaultLimits(dataDir string) Limits {
+	key := strings.TrimSpace(os.Getenv("STOCKYARD_LICENSE_KEY"))
+	source := "env"
+	if key == "" && dataDir != "" {
+		if data, err := os.ReadFile(filepath.Join(dataDir, licenseFilename)); err == nil {
+			key = strings.TrimSpace(string(data))
+			source = "file"
+		}
+	}
 	if key == "" {
-		log.Printf("[license] Free tier (5 items). Set STOCKYARD_LICENSE_KEY for Pro.")
-		log.Printf("[license] Get a key at https://stockyard.dev/billfold/")
-		return FreeLimits()
+		log.Printf("[license] no license key — trial required (writes blocked, reads allowed)")
+		log.Printf("[license] start a trial: https://stockyard.dev/")
+		log.Printf("[license] already have a key? open the dashboard and paste it under \"Activate License\"")
+		return TrialRequiredLimits()
 	}
 	if validateLicenseKey(key, "billfold") {
-		log.Printf("[license] Pro license valid — unlimited")
+		log.Printf("[license] valid license loaded from %s — unlocked", source)
 		return ProLimits()
 	}
-	log.Printf("[license] Invalid key — free tier")
-	return FreeLimits()
+	log.Printf("[license] license key from %s did not validate — trial required", source)
+	return TrialRequiredLimits()
+}
+
+// PersistLicense writes a license key to the data directory so it survives
+// reboots without the env var. Called by the activation handler after the
+// key has been validated. Returns an error only if the write fails.
+func PersistLicense(dataDir, key string) error {
+	if dataDir == "" {
+		return os.ErrInvalid
+	}
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return err
+	}
+	// 0600 because the license key is a credential — anyone reading it
+	// off disk can use it as if they were the customer.
+	return os.WriteFile(filepath.Join(dataDir, licenseFilename), []byte(key), 0600)
+}
+
+// ValidateLicenseKey is the exported wrapper for the license validation
+// logic, used by the activation handler before persisting a key.
+func ValidateLicenseKey(key string) bool {
+	return validateLicenseKey(key, "billfold")
 }
 
 func LimitReached(limit, current int) bool {

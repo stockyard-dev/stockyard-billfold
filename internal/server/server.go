@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 
 	"github.com/stockyard-dev/stockyard-billfold/internal/store"
 )
@@ -17,6 +19,7 @@ const resourceName = "invoices"
 type Server struct {
 	db      *store.DB
 	mux     *http.ServeMux
+	limMu   sync.RWMutex // guards limits, which can be hot-reloaded by /api/license/activate
 	limits  Limits
 	dataDir string
 	pCfg    map[string]json.RawMessage
@@ -50,24 +53,110 @@ func New(db *store.DB, limits Limits, dataDir string) *Server {
 	s.mux.HandleFunc("GET /api/extras/{resource}/{id}", s.getExtras)
 	s.mux.HandleFunc("PUT /api/extras/{resource}/{id}", s.putExtras)
 
+	// License activation — accepts a key, validates, persists, hot-reloads tier
+	s.mux.HandleFunc("POST /api/license/activate", s.activateLicense)
+
 	// Dashboard
 	s.mux.HandleFunc("GET /ui", s.dashboard)
 	s.mux.HandleFunc("GET /ui/", s.dashboard)
 	s.mux.HandleFunc("GET /", s.root)
 
-	// Tier
-	s.mux.HandleFunc("GET /api/tier", func(w http.ResponseWriter, r *http.Request) {
-		wj(w, 200, map[string]any{
-			"tier":        s.limits.Tier,
-			"upgrade_url": "https://stockyard.dev/billfold/",
-		})
-	})
+	// Tier — read-only license info for dashboard banner. Always reachable.
+	s.mux.HandleFunc("GET /api/tier", s.tierInfo)
 
 	return s
 }
 
+// ServeHTTP wraps the underlying mux with a license-gate middleware.
+// In trial-required mode, all writes (POST/PUT/DELETE/PATCH) return 402
+// EXCEPT POST /api/license/activate (the only way out of trial state).
+// Reads are always allowed — the brand promise is that data on disk
+// stays accessible even without an active license.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if s.shouldBlockWrite(r) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusPaymentRequired)
+		w.Write([]byte(`{"error":"Trial required. Start a 14-day free trial at https://stockyard.dev/ — or paste an existing license key in the dashboard under \"Activate License\".","tier":"trial-required"}`))
+		return
+	}
 	s.mux.ServeHTTP(w, r)
+}
+
+// shouldBlockWrite returns true when the current tier is trial-required
+// AND the incoming request is a non-allowlisted write.
+func (s *Server) shouldBlockWrite(r *http.Request) bool {
+	s.limMu.RLock()
+	tier := s.limits.Tier
+	s.limMu.RUnlock()
+	if tier != "trial-required" {
+		return false
+	}
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	}
+	switch r.URL.Path {
+	case "/api/license/activate":
+		return false
+	}
+	return true
+}
+
+// activateLicense accepts {license_key: "SY-..."}, validates, persists
+// to dataDir/license.txt, and hot-reloads s.limits.
+func (s *Server) activateLicense(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 10*1024))
+	if err != nil {
+		we(w, 400, "could not read request body")
+		return
+	}
+	var req struct {
+		LicenseKey string `json:"license_key"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		we(w, 400, "invalid json: "+err.Error())
+		return
+	}
+	key := strings.TrimSpace(req.LicenseKey)
+	if key == "" {
+		we(w, 400, "license_key is required")
+		return
+	}
+	if !ValidateLicenseKey(key) {
+		we(w, 400, "license key is not valid for this product — make sure you copied the entire key from the welcome email, including the SY- prefix")
+		return
+	}
+	if err := PersistLicense(s.dataDir, key); err != nil {
+		log.Printf("billfold: license persist failed: %v", err)
+		we(w, 500, "could not save the license key to disk: "+err.Error())
+		return
+	}
+	s.limMu.Lock()
+	s.limits = ProLimits()
+	s.limMu.Unlock()
+	log.Printf("billfold: license activated via dashboard, persisted to %s/%s", s.dataDir, licenseFilename)
+	wj(w, 200, map[string]any{
+		"ok":   true,
+		"tier": "pro",
+	})
+}
+
+// tierInfo returns the current tier and a hint for the dashboard banner.
+func (s *Server) tierInfo(w http.ResponseWriter, r *http.Request) {
+	s.limMu.RLock()
+	tier := s.limits.Tier
+	s.limMu.RUnlock()
+	resp := map[string]any{
+		"tier": tier,
+	}
+	if tier == "trial-required" {
+		resp["trial_required"] = true
+		resp["start_trial_url"] = "https://stockyard.dev/"
+		resp["message"] = "Your trial is not active. Reads work, but you cannot add or change invoices until you start a 14-day trial or activate an existing license key."
+	} else {
+		resp["trial_required"] = false
+	}
+	wj(w, 200, resp)
 }
 
 // ─── helpers ──────────────────────────────────────────────────────
@@ -179,10 +268,6 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) create(w http.ResponseWriter, r *http.Request) {
-	if s.limits.MaxItems > 0 && s.db.Count() >= s.limits.MaxItems {
-		we(w, 402, "Free tier limit reached. Upgrade at https://stockyard.dev/billfold/")
-		return
-	}
 	var e store.Invoice
 	if err := json.NewDecoder(r.Body).Decode(&e); err != nil {
 		we(w, 400, "invalid json")
