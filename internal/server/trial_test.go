@@ -41,7 +41,7 @@ func newTrialServer(t *testing.T) (*Server, string) {
 		t.Fatalf("mkdir: %v", err)
 	}
 	store := newTestDB(t)
-	srv := New(store, TrialRequiredLimits(), dir)
+	srv := New(store, TrialRequiredLimits(), dir, nil)
 	return srv, dir
 }
 
@@ -119,7 +119,7 @@ func TestTrialMiddleware_allowlistedWritesPass(t *testing.T) {
 func TestTrialMiddleware_proTierBypassesGate(t *testing.T) {
 	dir := t.TempDir()
 	db := newTestDB(t)
-	srv := New(db, ProLimits(), dir)
+	srv := New(db, ProLimits(), dir, nil)
 
 	// Pro tier should let everything through.
 	body, _ := json.Marshal(map[string]string{"name": "Alice"})
@@ -137,7 +137,7 @@ func TestTrialMiddleware_emptyTierBypassesGate(t *testing.T) {
 	// pre-license-gate test suite still passes without modification.
 	dir := t.TempDir()
 	db := newTestDB(t)
-	srv := New(db, Limits{}, dir)
+	srv := New(db, Limits{}, dir, nil)
 
 	body, _ := json.Marshal(map[string]string{"name": "Alice"})
 	req := httptest.NewRequest("POST", "/api/invoices", bytes.NewReader(body))
@@ -176,7 +176,7 @@ func TestTierEndpoint_trialRequired(t *testing.T) {
 func TestTierEndpoint_pro(t *testing.T) {
 	dir := t.TempDir()
 	db := newTestDB(t)
-	srv := New(db, ProLimits(), dir)
+	srv := New(db, ProLimits(), dir, nil)
 
 	req := httptest.NewRequest("GET", "/api/tier", nil)
 	w := httptest.NewRecorder()
@@ -271,7 +271,7 @@ func TestActivate_validKeyFlipsToProAndPersists(t *testing.T) {
 
 	dir := t.TempDir()
 	db := newTestDB(t)
-	srv := New(db, TrialRequiredLimits(), dir)
+	srv := New(db, TrialRequiredLimits(), dir, nil)
 
 	// Pre-activation: writes blocked
 	body, _ := json.Marshal(map[string]string{"name": "Alice"})

@@ -6,9 +6,11 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 
 	"github.com/stockyard-dev/stockyard-billfold/internal/server"
 	"github.com/stockyard-dev/stockyard-billfold/internal/store"
+	"github.com/stockyard-dev/stockyard/bus"
 )
 
 var version = "dev"
@@ -40,7 +42,19 @@ func main() {
 	}
 	defer db.Close()
 
-	srv := server.New(db, server.DefaultLimits(dataDir), dataDir)
+	// Bus lives one level up from the private data dir so every tool
+	// in a bundle shares one _bus.db. Standalone use (no bundle dir)
+	// is fine — the bus just becomes a private log only we can see.
+	// Failures are non-fatal; billfold must boot with or without it.
+	var b *bus.Bus
+	if bb, berr := bus.Open(filepath.Dir(dataDir), "billfold"); berr != nil {
+		log.Printf("billfold: bus disabled: %v", berr)
+	} else {
+		b = bb
+		defer b.Close()
+	}
+
+	srv := server.New(db, server.DefaultLimits(dataDir), dataDir, b)
 
 	fmt.Printf("\n  Billfold v%s — Self-hosted invoice generator\n", version)
 	fmt.Printf("  Dashboard:  http://localhost:%s/ui\n", port)

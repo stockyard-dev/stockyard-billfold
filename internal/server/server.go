@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"github.com/stockyard-dev/stockyard-billfold/internal/store"
+	"github.com/stockyard-dev/stockyard/bus"
 )
 
 // resourceName is the canonical key for extras storage and the API path.
@@ -23,14 +24,16 @@ type Server struct {
 	limits  Limits
 	dataDir string
 	pCfg    map[string]json.RawMessage
+	bus     *bus.Bus // optional cross-tool event bus; nil if not configured
 }
 
-func New(db *store.DB, limits Limits, dataDir string) *Server {
+func New(db *store.DB, limits Limits, dataDir string, b *bus.Bus) *Server {
 	s := &Server{
 		db:      db,
 		mux:     http.NewServeMux(),
 		limits:  limits,
 		dataDir: dataDir,
+		bus:     b,
 	}
 	s.loadPersonalConfig()
 
@@ -281,7 +284,14 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		we(w, 500, "create failed")
 		return
 	}
-	wj(w, 201, s.db.Get(e.ID))
+	created := s.db.Get(e.ID)
+	// Fire invoice.sent only if the invoice is created already in a
+	// non-draft state. Most invoices land as 'draft' and transition
+	// to 'sent' via an update — that transition is caught below.
+	if created != nil && created.Status == "sent" {
+		s.publishInvoice("invoice.sent", created)
+	}
+	wj(w, 201, created)
 }
 
 func (s *Server) get(w http.ResponseWriter, r *http.Request) {
@@ -328,7 +338,21 @@ func (s *Server) update(w http.ResponseWriter, r *http.Request) {
 		we(w, 500, "update failed")
 		return
 	}
-	wj(w, 200, s.db.Get(patch.ID))
+	updated := s.db.Get(patch.ID)
+	// Fire bus events on state transitions only — NOT on every edit.
+	// Idempotency: subscribers are expected to be keyed on invoice_id
+	// but we still don't want to re-fire e.g. paid→paid over and over.
+	if updated != nil && existing.Status != updated.Status {
+		switch updated.Status {
+		case "sent":
+			s.publishInvoice("invoice.sent", updated)
+		case "paid":
+			s.publishInvoice("invoice.paid", updated)
+		case "overdue":
+			s.publishInvoice("invoice.overdue", updated)
+		}
+	}
+	wj(w, 200, updated)
 }
 
 func (s *Server) del(w http.ResponseWriter, r *http.Request) {
@@ -348,6 +372,31 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		"service": "billfold",
 		"count":   s.db.Count(),
 	})
+}
+
+// publishInvoice is the fire-and-forget wrapper around the optional
+// bus. No-op when s.bus is nil (standalone mode). Runs in a goroutine
+// so HTTP responses never block on bus writes. Errors are logged,
+// never surfaced — a failed publish must not break user-facing requests.
+//
+// Payload shape is locked by docs/BUS-TOPICS.md in stockyard-desktop.
+func (s *Server) publishInvoice(topic string, inv *store.Invoice) {
+	if s.bus == nil || inv == nil {
+		return
+	}
+	payload := map[string]any{
+		"invoice_id":  inv.ID,
+		"client_name": inv.ClientName,
+		"amount":      inv.Amount,
+		"due_date":    inv.DueDate,
+		"status":      inv.Status,
+		"paid_at":     inv.PaidAt,
+	}
+	go func() {
+		if _, err := s.bus.Publish(topic, payload); err != nil {
+			log.Printf("billfold: bus publish %s failed: %v", topic, err)
+		}
+	}()
 }
 
 func init() {
