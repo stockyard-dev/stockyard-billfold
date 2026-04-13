@@ -1,7 +1,9 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -9,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/stockyard-dev/stockyard-billfold/internal/store"
 	"github.com/stockyard-dev/stockyard/bus"
@@ -67,6 +70,7 @@ func New(db *store.DB, limits Limits, dataDir string, b *bus.Bus) *Server {
 	// Tier — read-only license info for dashboard banner. Always reachable.
 	s.mux.HandleFunc("GET /api/tier", s.tierInfo)
 
+	s.subscribeBus()
 	return s
 }
 
@@ -397,6 +401,270 @@ func (s *Server) publishInvoice(topic string, inv *store.Invoice) {
 			log.Printf("billfold: bus publish %s failed: %v", topic, err)
 		}
 	}()
+}
+
+// subscribeBus wires cross-tool events to auto-drafted invoice actions.
+// No-op when s.bus is nil (standalone mode).
+//
+// Allowlist-only (not SubscribeAll) so unexpected future topics don't
+// silently start creating invoices. Expanding this list is a
+// PR-reviewed change, not a config flag — every addition is "a new
+// way invoices can appear without the user clicking New Invoice."
+//
+// Idempotency: each handler embeds a marker in invoice Notes or
+// LineItems ([quote:<id>], time:<entry_id>) and linear-scans existing
+// invoices before creating/mutating. Bus cursor initializes at the
+// current high-water mark on Open (see bus.go:199), so process
+// restart does NOT replay old events — duplicate fires during a
+// single bundle lifetime are the only dedup concern today.
+//
+// Handlers return nil on decode/data errors: we don't want the bus
+// retrying a permanently broken payload, and the bus has no retry
+// semantics anyway (see bus.go Handler docstring).
+func (s *Server) subscribeBus() {
+	if s.bus == nil {
+		return
+	}
+	s.bus.Subscribe("quote.accepted", func(_ context.Context, e bus.Event) error {
+		return s.handleQuoteAccepted(e)
+	})
+	s.bus.Subscribe("time.logged", func(_ context.Context, e bus.Event) error {
+		return s.handleTimeLogged(e)
+	})
+	log.Printf("billfold: subscribed to quote.accepted, time.logged")
+}
+
+// handleQuoteAccepted auto-drafts an invoice from an accepted quote.
+//
+// Shape decisions (see BUS-TOPICS.md):
+//   - ClientName = payload.client_name (free text, no contact_id FK
+//     in billfold today).
+//   - Amount = int(payload.total). Billfold's Amount column is INTEGER;
+//     estimate carries total as float64. Decimals are truncated. Unit
+//     is whatever the two tools agree on (neither declares currency).
+//   - Status = "draft". User reviews before sending.
+//   - LineItems = one line referencing the quote: description = quote
+//     title, amount = int(total), source = "quote:<quote_id>".
+//   - Notes = human-readable provenance including the [quote:<id>]
+//     marker used for idempotency.
+//   - DueDate = "" (user fills in — we have no policy to infer).
+func (s *Server) handleQuoteAccepted(e bus.Event) error {
+	var p map[string]any
+	if err := json.Unmarshal(e.Payload, &p); err != nil {
+		log.Printf("billfold: decode quote.accepted: %v", err)
+		return nil
+	}
+	quoteID := stringField(p, "quote_id")
+	if quoteID == "" {
+		log.Printf("billfold: quote.accepted missing quote_id, skipping")
+		return nil
+	}
+	marker := fmt.Sprintf("[quote:%s]", quoteID)
+	// Idempotency: skip if an invoice already references this quote.
+	for _, existing := range s.db.List() {
+		if strings.Contains(existing.Notes, marker) {
+			log.Printf("billfold: quote.accepted for %s already drafted as invoice %s, skipping", quoteID, existing.ID)
+			return nil
+		}
+	}
+	clientName := stringField(p, "client_name")
+	total := floatField(p, "total")
+	amount := int(total)
+	title := stringField(p, "title")
+	if title == "" {
+		title = "Services from accepted quote"
+	}
+	lineItems := []map[string]any{{
+		"description": title,
+		"amount":      amount,
+		"source":      "quote:" + quoteID,
+	}}
+	liJSON, err := json.Marshal(lineItems)
+	if err != nil {
+		log.Printf("billfold: marshal line items for quote %s: %v", quoteID, err)
+		return nil
+	}
+	notes := fmt.Sprintf("Auto-drafted from accepted quote on %s. %s",
+		time.Now().UTC().Format("2006-01-02"), marker)
+	inv := store.Invoice{
+		ClientName: clientName,
+		Amount:     amount,
+		Status:     "draft",
+		LineItems:  string(liJSON),
+		Notes:      notes,
+	}
+	if err := s.db.Create(&inv); err != nil {
+		log.Printf("billfold: create invoice from quote %s: %v", quoteID, err)
+		return nil
+	}
+	log.Printf("billfold: auto-drafted invoice %s from quote %s (client=%q amount=%d)",
+		inv.ID, quoteID, clientName, amount)
+	return nil
+}
+
+// handleTimeLogged appends a line item to a matching draft invoice
+// when a billable time entry is logged.
+//
+// Shape decisions (see BUS-TOPICS.md):
+//   - Only billable=true entries trigger the append. Non-billable
+//     time is out of scope for invoicing.
+//   - Match: the time entry's `project` (free text) is compared
+//     case-insensitively + trimmed against existing DRAFT invoices'
+//     `client_name`. First match wins (List() returns created_at DESC
+//     so this is the most recent draft for that client).
+//   - No match = log and drop. We do NOT auto-create an invoice from
+//     a time entry alone — that would silently manufacture invoices
+//     the user may not intend. The user must already have a draft
+//     open for that client for line items to accumulate.
+//   - Amount = 0. The payload carries duration in seconds but no
+//     rate, and billfold stores no contact-rate map. The user sets
+//     the line's amount when they finalize the invoice.
+//   - Idempotency: each appended line includes source="time:<id>".
+//     Before appending, scan the existing LineItems JSON for this
+//     marker and skip if already present.
+func (s *Server) handleTimeLogged(e bus.Event) error {
+	var p map[string]any
+	if err := json.Unmarshal(e.Payload, &p); err != nil {
+		log.Printf("billfold: decode time.logged: %v", err)
+		return nil
+	}
+	if !boolField(p, "billable") {
+		return nil
+	}
+	entryID := stringField(p, "entry_id")
+	if entryID == "" {
+		log.Printf("billfold: time.logged missing entry_id, skipping")
+		return nil
+	}
+	project := strings.TrimSpace(stringField(p, "project"))
+	if project == "" {
+		log.Printf("billfold: time.logged has empty project, nothing to match against, skipping entry %s", entryID)
+		return nil
+	}
+	needle := strings.ToLower(project)
+	var target *store.Invoice
+	for _, inv := range s.db.List() {
+		if inv.Status != "draft" {
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(inv.ClientName)) == needle {
+			i := inv
+			target = &i
+			break
+		}
+	}
+	if target == nil {
+		log.Printf("billfold: time.logged entry %s (project=%q) has no matching draft invoice, skipping", entryID, project)
+		return nil
+	}
+	marker := "time:" + entryID
+	// Parse existing line items. Tolerate empty / "[]" / malformed.
+	existingRaw := strings.TrimSpace(target.LineItems)
+	var items []map[string]any
+	if existingRaw != "" && existingRaw != "[]" {
+		if err := json.Unmarshal([]byte(existingRaw), &items); err != nil {
+			// Malformed JSON from an older manual edit. Don't clobber
+			// the user's data — skip and surface the issue in logs.
+			log.Printf("billfold: invoice %s has unparseable line_items, not auto-appending time entry %s: %v", target.ID, entryID, err)
+			return nil
+		}
+	}
+	// Idempotency: skip if this entry already contributed a line.
+	for _, it := range items {
+		if src, _ := it["source"].(string); src == marker {
+			return nil
+		}
+	}
+	desc := strings.TrimSpace(stringField(p, "description"))
+	if desc == "" {
+		desc = strings.TrimSpace(stringField(p, "task"))
+	}
+	if desc == "" {
+		desc = "Time logged"
+	}
+	durationSec := intField(p, "duration_seconds")
+	items = append(items, map[string]any{
+		"description":      desc,
+		"amount":           0,
+		"source":           marker,
+		"duration_seconds": durationSec,
+	})
+	newJSON, err := json.Marshal(items)
+	if err != nil {
+		log.Printf("billfold: marshal appended line items for invoice %s: %v", target.ID, err)
+		return nil
+	}
+	target.LineItems = string(newJSON)
+	if err := s.db.Update(target); err != nil {
+		log.Printf("billfold: update invoice %s with time entry %s: %v", target.ID, entryID, err)
+		return nil
+	}
+	log.Printf("billfold: appended time entry %s (%ds) to invoice %s (client=%q)",
+		entryID, durationSec, target.ID, target.ClientName)
+	return nil
+}
+
+// stringField returns m[k] as a string, or "" if absent / wrong type.
+func stringField(m map[string]any, k string) string {
+	if v, ok := m[k].(string); ok {
+		return v
+	}
+	return ""
+}
+
+// floatField returns m[k] as a float64, tolerating int → float
+// coercion (JSON numbers unmarshal as float64 anyway, but cover the
+// case of an explicit integer field).
+func floatField(m map[string]any, k string) float64 {
+	switch v := m[k].(type) {
+	case float64:
+		return v
+	case int:
+		return float64(v)
+	case int64:
+		return float64(v)
+	case json.Number:
+		f, _ := v.Float64()
+		return f
+	}
+	return 0
+}
+
+// intField returns m[k] as an int. JSON numbers are float64 after
+// Unmarshal, so we truncate. Booleans, strings, nil → 0.
+func intField(m map[string]any, k string) int {
+	switch v := m[k].(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case json.Number:
+		i, _ := v.Int64()
+		return int(i)
+	}
+	return 0
+}
+
+// boolField returns m[k] as a bool. Accepts real bools, 0/1 ints
+// (sundial stores billable as int but publishes as bool), and "true"
+// string (defensive — nothing should publish this, but cheap to
+// tolerate).
+func boolField(m map[string]any, k string) bool {
+	switch v := m[k].(type) {
+	case bool:
+		return v
+	case float64:
+		return v != 0
+	case int:
+		return v != 0
+	case int64:
+		return v != 0
+	case string:
+		return v == "true" || v == "1"
+	}
+	return false
 }
 
 func init() {
